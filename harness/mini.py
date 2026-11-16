@@ -6,7 +6,7 @@ Usage: mini.py <task...>
 Sends the task to an OpenAI-compatible chat completions endpoint with one tool, `bash`. Runs each
 command the model asks for in the current folder and sends back the exit code and output. Stops
 when the model answers without a tool call (exit 0) or at the step limit (exit 2). Exits 1 when the
-endpoint fails.
+endpoint fails, a response is malformed, or the answer is cut off or filtered.
 
 Settings, as environment variables:
   MINI_API_KEY, else CEREBRAS_API_KEY   API key (required; removed from the commands' environment)
@@ -16,10 +16,12 @@ Settings, as environment variables:
   MINI_CMD_TIMEOUT  seconds per command, default 60
   MINI_OUTPUT_CAP   bytes of command output sent back (head and tail), default 10000, minimum 100
   MINI_RETRY_BASE   first retry wait in seconds, default 1
+  MINI_MAX_RESPONSE_BYTES  largest API response accepted, default 16 MB
 """
 
 import http.client
 import json
+import math
 import os
 import platform
 import signal
@@ -57,6 +59,7 @@ ATTEMPTS = 4
 RETRY_AFTER_CAP = 30
 RETRYABLE = {429, 500, 502, 503, 504}
 MIN_OUTPUT_CAP = 100
+STOPPED_SHORT = {"length": "was cut off at the token limit", "content_filter": "was blocked by a content filter"}
 READER_GRACE = 2
 
 
@@ -68,17 +71,27 @@ def log(text):
     print(text, file=sys.stderr, flush=True)
 
 
+def positive(name, default, kind):
+    """Reads a numeric setting. Raises ValueError unless it is a finite number above zero."""
+    raw = os.environ.get(name, default)
+    value = kind(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a number above zero, got {raw!r}")
+    return value
+
+
 def settings():
-    """Reads the environment. Raises ValueError on a setting that is not a number."""
+    """Reads the environment. Raises ValueError on a bad numeric setting."""
     env = os.environ
     return {
         "key": env.get("MINI_API_KEY") or env.get("CEREBRAS_API_KEY") or "",
         "url": env.get("MINI_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/") + "/chat/completions",
         "model": env.get("MINI_MODEL", "gpt-oss-120b"),
-        "max_steps": int(env.get("MINI_MAX_STEPS", "30")),
-        "cmd_timeout": float(env.get("MINI_CMD_TIMEOUT", "60")),
+        "max_steps": positive("MINI_MAX_STEPS", "30", int),
+        "cmd_timeout": positive("MINI_CMD_TIMEOUT", "60", float),
         "output_cap": max(int(env.get("MINI_OUTPUT_CAP", "10000")), MIN_OUTPUT_CAP),
-        "retry_base": float(env.get("MINI_RETRY_BASE", "1")),
+        "retry_base": positive("MINI_RETRY_BASE", "1", float),
+        "max_response": positive("MINI_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024), int),
     }
 
 
@@ -101,6 +114,24 @@ def error_detail(err, key):
     return body.replace(key, "[key]")[:200]
 
 
+def read_body(response, limit):
+    """Reads in chunks up to limit. Returns (bytes, None), or (bytes, "too large" or "truncated")."""
+    chunks, size = [], 0
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > limit:
+            return b"", f"too large (over {limit} bytes)"
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    declared = response.headers.get("Content-Length")
+    if declared and declared.isdigit() and len(raw) < int(declared):
+        return raw, "truncated"
+    return raw, None
+
+
 def post_once(cfg, body):
     """One request. Returns (parsed JSON, None) or (None, (retryable, message, retry_after))."""
     request = urllib.request.Request(
@@ -110,7 +141,9 @@ def post_once(cfg, body):
     )
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
-            raw = response.read()
+            raw, problem = read_body(response, cfg["max_response"])
+        if problem:
+            return None, (problem == "truncated", f"response from {cfg['url']} is {problem}", None)
     except urllib.error.HTTPError as err:
         message = f"HTTP {err.code} from {cfg['url']}: {error_detail(err, cfg['key'])}"
         return None, (err.code in RETRYABLE, message, err.headers.get("Retry-After"))
@@ -194,14 +227,17 @@ def kill_group(pid):
 
 def run_bash(command, cfg):
     # Own session, so killing the group kills everything the command started, not just the shell.
-    proc = subprocess.Popen(
-        ["bash", "-c", command],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=command_env(cfg["key"]),
-    )
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=command_env(cfg["key"]),
+        )
+    except (OSError, ValueError) as err:
+        return f"error: could not start bash: {err}"
     capture = Capture(cfg["output_cap"])
     reader = threading.Thread(target=capture.drain, args=(os.dup(proc.stdout.fileno()),), daemon=True)
     proc.stdout.close()
@@ -267,10 +303,21 @@ def first_message(data):
 
 
 def tool_calls(message, step):
-    calls = [c for c in (message.get("tool_calls") or []) if isinstance(c, dict)]
-    for index, call in enumerate(calls):
-        call["id"] = call.get("id") or f"call_{step}_{index}"
-    return calls
+    """The message's tool calls, each with an id and string arguments, as the next request needs."""
+    raw = message.get("tool_calls")
+    if raw is None:
+        return []
+    well_formed = isinstance(raw, list) and all(
+        isinstance(c, dict) and isinstance(c.get("function"), dict) for c in raw
+    )
+    if not well_formed:
+        raise ApiError("response has a malformed tool call")
+    for index, call in enumerate(raw):
+        call["id"] = str(call.get("id") or f"call_{step}_{index}")
+        arguments = call["function"].get("arguments")
+        if not isinstance(arguments, str):
+            call["function"]["arguments"] = json.dumps(arguments if arguments is not None else {})
+    return raw
 
 
 def run(task, cfg, usage):
@@ -283,6 +330,9 @@ def run(task, cfg, usage):
         usage["completion"] += as_int(reported.get("completion_tokens"))
         message = first_message(data)
         calls = tool_calls(message, step)
+        finish = (data.get("choices") or [{}])[0].get("finish_reason")
+        if not calls and finish in STOPPED_SHORT:
+            raise ApiError(f"the model's answer {STOPPED_SHORT[finish]}")
         assistant = {"role": "assistant", "content": message.get("content")}
         if calls:
             assistant["tool_calls"] = calls

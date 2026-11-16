@@ -60,10 +60,12 @@ class FakeServer:
                 item = outer.script[index]
                 status, payload, headers = item if isinstance(item, tuple) else (200, item, {})
                 data = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+                headers = dict(headers)
+                declared = headers.pop("X-Declared-Length", str(len(data)))
                 self.send_response(status)
                 for name, value in headers.items():
                     self.send_header(name, value)
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", declared)
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -315,11 +317,11 @@ class MiniTest(unittest.TestCase):
 
     # 21, review: commands cannot read the API key
     def test_key_not_in_command_environment(self):
-        command = 'echo "m=$MINI_API_KEY c=$CEREBRAS_API_KEY"; env'
+        command = 'echo "m=$MINI_API_KEY c=$CEREBRAS_API_KEY o=$OTHER_TOKEN"; env'
         server = self.serve(reply([tool_call(command)]), done())
-        self.run_mini(server.url, CEREBRAS_API_KEY=KEY)
+        self.run_mini(server.url, CEREBRAS_API_KEY=KEY, OTHER_TOKEN=KEY)
         content = self.tool_messages(server.requests[1])[0]["content"]
-        self.assertIn("m= c=", content)
+        self.assertIn("m= c= o=", content)
         self.assertNotIn(KEY, content)
 
     # 22, review: memory stays bounded for a command that prints without end
@@ -354,6 +356,8 @@ class MiniTest(unittest.TestCase):
         result = self.run_mini(server.url)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("obj-ok", self.tool_messages(server.requests[1])[0]["content"])
+        echoed = server.requests[1]["body"]["messages"][2]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(json.loads(echoed), {"command": "echo obj-ok"})
 
     # 25, review: a JSON body that is not an object
     def test_response_not_an_object(self):
@@ -375,11 +379,14 @@ class MiniTest(unittest.TestCase):
     # 27, review: a setting that is not a number
     def test_bad_setting(self):
         server = self.serve(done())
-        result = self.run_mini(server.url, MINI_MAX_STEPS="abc")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("bad setting", result.stderr)
+        for name, value in [("MINI_MAX_STEPS", "abc"), ("MINI_MAX_STEPS", "0"),
+                            ("MINI_CMD_TIMEOUT", "-1"), ("MINI_RETRY_BASE", "nan"),
+                            ("MINI_MAX_RESPONSE_BYTES", "-5")]:
+            result = self.run_mini(server.url, **{name: value})
+            self.assertEqual(result.returncode, 2, f"{name}={value}")
+            self.assertIn("bad setting", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(len(server.requests), 0)
-        self.assertNotIn("Traceback", result.stderr)
 
     # 28, review: a tool call without an id still gets a matching id
     def test_tool_call_without_id(self):
@@ -404,7 +411,9 @@ class MiniTest(unittest.TestCase):
         command = "python3 -c \"print('x' * 5000)\""
         server = self.serve(reply([tool_call(command)]), done())
         self.run_mini(server.url, MINI_OUTPUT_CAP="0")
-        self.assertLess(len(self.tool_messages(server.requests[1])[0]["content"]), 300)
+        content = self.tool_messages(server.requests[1])[0]["content"]
+        self.assertLess(len(content), 300)
+        self.assertIn("x" * 40, content)
 
 
     # 31, review: a key that crosses the 200-character cut of an error body is still redacted
@@ -413,6 +422,99 @@ class MiniTest(unittest.TestCase):
         result = self.run_mini(server.url)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn(KEY[:8], result.stdout + result.stderr)
+
+
+    # #3 M1: an answer cut off at the token limit is not success
+    def test_cut_off_answer_fails(self):
+        body = done("partial")
+        body["choices"][0]["finish_reason"] = "length"
+        server = self.serve(body)
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("cut off", result.stderr)
+
+    # #3 M2: a malformed tool call is not a final answer
+    def test_malformed_tool_call_fails(self):
+        body = reply()
+        body["choices"][0]["message"]["tool_calls"] = ["not a dict"]
+        server = self.serve(body)
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("malformed tool call", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    # #3 M5: an oversized response is refused
+    def test_oversized_response(self):
+        server = self.serve(done("y" * 5000))
+        result = self.run_mini(server.url, MINI_MAX_RESPONSE_BYTES="1000")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("over 1000 bytes", result.stderr)
+
+
+    # #3 review: a command with a NUL byte is an error for the model, not a crash
+    def test_command_with_nul_byte(self):
+        server = self.serve(reply([tool_call("echo a\x00b")]), done())
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not start bash", self.tool_messages(server.requests[1])[0]["content"])
+
+    # #3 review: a body shorter than its Content-Length is retried, then reported as truncated
+    def test_truncated_response_retried(self):
+        body = json.dumps(done())
+        server = self.serve((200, body, {"X-Declared-Length": str(len(body) + 100)}))
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(server.requests), 4)
+        self.assertIn("truncated", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    # #3 review: a tool call whose function is not an object
+    def test_function_not_an_object(self):
+        body = reply()
+        body["choices"][0]["message"]["tool_calls"] = [{"id": "c", "type": "function", "function": "bash"}]
+        server = self.serve(body)
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("malformed tool call", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    # #3 review: a filtered answer is not success
+    def test_content_filter_fails(self):
+        body = done("")
+        body["choices"][0]["finish_reason"] = "content_filter"
+        server = self.serve(body)
+        result = self.run_mini(server.url)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("content filter", result.stderr)
+
+    # #3 review: null arguments are echoed back as a JSON string
+    def test_null_arguments_echoed_as_string(self):
+        call = {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": None}}
+        server = self.serve(reply([call]), done())
+        self.run_mini(server.url)
+        echoed = server.requests[1]["body"]["messages"][2]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(echoed, "{}")
+
+
+    # #3 review round 3: tool_calls that is present but not a list is malformed, even when empty
+    def test_falsy_non_list_tool_calls(self):
+        for value in ({}, "", 0):
+            body = reply(content="x")
+            body["choices"][0]["message"]["tool_calls"] = value
+            server = self.serve(body)
+            result = self.run_mini(server.url)
+            self.assertEqual(result.returncode, 1, repr(value))
+            self.assertIn("malformed tool call", result.stderr)
+
+    # #3 review round 3: a numeric tool-call id is sent back as a string
+    def test_numeric_tool_call_id(self):
+        call = tool_call("echo hi")
+        call["id"] = 7
+        server = self.serve(reply([call]), done())
+        self.run_mini(server.url)
+        messages = server.requests[1]["body"]["messages"]
+        self.assertEqual(messages[2]["tool_calls"][0]["id"], "7")
+        self.assertEqual(messages[3]["tool_call_id"], "7")
 
 
 if __name__ == "__main__":

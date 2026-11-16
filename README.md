@@ -4,8 +4,9 @@ Checks whether a coding agent and a model can complete a basic tool-using loop: 
 file, edit it, run the test again. Each run gets a fresh git repo with a one-line bug in `calc.py`
 and a plain `python3` test, so no test framework or network access is needed.
 
-It proves tool calls work and shows how long the loop takes. It does not prove a model can handle a
-real ticket.
+It shows whether an agent and model can get through the loop, and how long it takes. The verdict
+checks only that the test passes afterwards, not how the file was changed, so read the run folder
+before trusting a pass. It does not prove a model can handle a real ticket.
 
 Requirements: bash, perl, python3 and git. Tested on macOS; CI runs the self-test on Ubuntu.
 
@@ -36,7 +37,14 @@ Settings, as environment variables:
 
 The agent command runs from inside each run folder, so give it as a command on your `PATH` or an
 absolute path, not `./something`. The agents run with approvals turned off in that folder. Run them
-on a machine where that is acceptable.
+on a machine where that is acceptable, from a shell holding only the credentials the agent needs:
+anything in the environment is visible to the commands the agent runs.
+
+The verdict is a pass only when the test prints `OK` as its last line and exits 0. The verdict shows
+the last line the test printed, followed by the exit code when it is not 0 (`test='OK (exit 1)'`), or
+`test timed out after 30s`. Labels may use letters, digits and `. _ : + @ -`, so model names such as
+`gpt-oss:20b` work. `runs` and `LIMIT` must be whole numbers above zero.
+Without `TMPDIR` set, runs go under `/tmp/agent-trials`; on a shared machine, set `TRIALS_DIR`.
 
 ## Output
 
@@ -73,14 +81,16 @@ seconds of model time.
 
 ## A minimal harness
 
-`harness/mini.py` is a coding agent in about 320 lines of standard-library Python, small enough to
+`harness/mini.py` is a coding agent in about 350 lines of standard-library Python, small enough to
 read in one sitting. It offers the model one tool, `bash`, runs each command in the task folder, and
 sends back the exit code and output, keeping only the head and tail of long output. Each command
-runs in its own process group, which is killed when the command times out or finishes, so nothing
-started in the background survives into the next step. The API key is removed from the commands'
-environment. It stops when
-the model answers without a tool call, or at a step limit. It works with any OpenAI-compatible chat
-completions endpoint and defaults to Cerebras.
+runs in its own process group, which is killed when the command times out or finishes, so
+background processes do not survive into the next step; a process that calls `setsid` leaves the
+group and is not reached. The API key is removed from the commands' environment, but this is not
+isolation: on Linux a command can read the harness's own environment through `/proc`. It stops when
+the model answers without a tool call (exit 0), at a step limit (exit 2), or when the endpoint fails
+or the answer is cut off at the token limit (exit 1). It works with any OpenAI-compatible chat
+completions endpoint that supports `tools`, and defaults to Cerebras.
 
 ```bash
 CEREBRAS_API_KEY=... ./agent-trials.sh mini 3 python3 "$PWD/harness/mini.py"
@@ -125,10 +135,11 @@ python3 -m unittest discover -s harness -v
 test/selftest.sh
 ```
 
-Runs the harness with fake agents and no network, in about a minute. It checks that a fix passes, a
+Runs the harness with fake agents and no network, in about two minutes. It checks that a fix passes, a
 no-op fails, an agent past `LIMIT` is killed, background processes an agent leaves behind are killed
 whether it timed out or exited, a hanging test does not hang the harness, a relative `TRIALS_DIR`
-works, and the prompt arrives as the last argument.
+works, the prompt arrives as the last argument, a test that prints `OK` but exits non-zero is not a
+pass, a detached process cannot hang the verdict, and bad labels, folders and counts are refused.
 
 ## License
 
