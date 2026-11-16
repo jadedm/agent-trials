@@ -14,3 +14,5 @@ jobs:
         run: shellcheck agent-trials.sh examples/*.sh test/*.sh
       - name: selftest
         run: test/selftest.sh
+      - name: harness unit tests
+        run: python3 -m unittest discover -s harness -v

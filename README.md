@@ -71,6 +71,44 @@ The first local run includes loading the model into memory. On Cerebras most of 
 startup and running the test, not model time: a single request for a short function took 0.07
 seconds of model time.
 
+## A minimal harness
+
+`harness/mini.py` is a coding agent in about 320 lines of standard-library Python, small enough to
+read in one sitting. It offers the model one tool, `bash`, runs each command in the task folder, and
+sends back the exit code and output, keeping only the head and tail of long output. Each command
+runs in its own process group, which is killed when the command times out or finishes, so nothing
+started in the background survives into the next step. The API key is removed from the commands'
+environment. It stops when
+the model answers without a tool call, or at a step limit. It works with any OpenAI-compatible chat
+completions endpoint and defaults to Cerebras.
+
+```bash
+CEREBRAS_API_KEY=... ./agent-trials.sh mini 3 python3 "$PWD/harness/mini.py"
+```
+
+Use an absolute path, since each trial runs in its own folder. Settings (`MINI_BASE_URL`,
+`MINI_MODEL`, `MINI_MAX_STEPS`, `MINI_CMD_TIMEOUT` and others) are listed at the top of the file.
+Each step and the total token count go to stderr, so `err.txt` in a run folder shows what the run did
+and cost.
+
+What three versions of the system prompt did, on the same bug with `gpt-oss-120b` on Cerebras, three
+runs each, all passing:
+
+| Prompt | Seconds per run | Tokens per run | What the transcripts showed |
+|---|---|---|---|
+| Basic instructions | 7, 7, 7 | 6,359 to 6,929 | Tried `apply_patch` 2 or 3 times, then rewrote the file and added a docstring |
+| Plus "no `apply_patch`, smallest change, no docstrings" | 8, 6, 8 | 6,050 to 7,145 | One-line diffs; still tried `apply_patch`; GNU `sed -i` failed on macOS |
+| Plus the operating system | 5, 6, 5 | 4,113 to 5,183 | Used `sed -i ''` first time; still tries `apply_patch` once or twice |
+
+`gpt-oss` models appear to have been trained with Codex's `apply_patch` tool, and keep reaching for
+it even when told it does not exist. Offering an `apply_patch` tool is the obvious next experiment.
+
+Tests run against a fake server, with no network or key:
+
+```bash
+python3 -m unittest discover -s harness -v
+```
+
 ## Agent notes
 
 - **opencode** works with Cerebras through its built-in `cerebras` provider. Pass `--standalone`,
