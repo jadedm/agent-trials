@@ -1,0 +1,23 @@
+name: Agent or provider result
+description: Share a result for an agent and model not in the README
+labels: [result]
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and version
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and where it ran
+    validations:
+      required: true
+  - type: textarea
+    id: lines
+    attributes:
+      label: Result lines
+      render: text
+    validations:
+      required: true
